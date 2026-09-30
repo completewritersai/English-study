@@ -317,6 +317,12 @@ if (!configured) {
       const { error } = await state.client.auth.signOut();
       if (error) message(`로그아웃하지 못했어요. ${error.message}`, true);
     });
+    document.addEventListener("visibilitychange", async () => {
+      if (!document.hidden && state.user) {
+        try { await loadCards(); }
+        catch (error) { message(`최신 단어장을 불러오지 못했어요. ${error.message}`, true); }
+      }
+    });
     setInterval(() => { if (state.user) render(); }, 60_000);
   } catch (error) {
     showOnly("auth-view");
