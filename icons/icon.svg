@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="하루 표현장">
+  <rect width="512" height="512" rx="112" fill="#236b49"/>
+  <circle cx="380" cy="126" r="28" fill="#e9c879"/>
+  <rect x="115" y="139" width="263" height="252" rx="35" fill="#d7e9d5" transform="rotate(-8 246.5 265)"/>
+  <rect x="130" y="126" width="263" height="252" rx="35" fill="#fffdf5"/>
+  <path d="M188 211h146M188 263h117M188 315h76" stroke="#236b49" stroke-width="21" stroke-linecap="round"/>
+</svg>
