@@ -1,7 +1,7 @@
 const config = window.APP_CONFIG ?? {};
-const configured = Boolean(config.supabaseUrl && config.supabasePublishableKey);
+const configured = /^[\w.-]+\/[\w.-]+$/.test(config.dataRepo ?? "");
 const $ = (selector) => document.querySelector(selector);
-const state = { client: null, user: null, cards: [], view: "today", allOrder: [], allIndex: 0, revealed: false, lastReviewedId: null };
+const state = { token: null, cards: [], view: "today", allOrder: [], allIndex: 0, revealed: false, lastReviewedId: null };
 
 function showOnly(id) {
   for (const view of ["setup-view", "auth-view", "app-view"]) {
@@ -61,7 +61,7 @@ function flashcard(card, kind) {
 }
 
 function render() {
-  if (!state.user) return;
+  if (!state.token) return;
   $("#total-count").textContent = state.cards.length;
   $("#due-count").textContent = dueCards().length;
   for (const tab of document.querySelectorAll(".tab")) {
@@ -162,23 +162,96 @@ function openDialog(card = null) {
   $("#phrase").focus();
 }
 
-async function loadCards() {
-  if (!state.user) return;
-  const userId = state.user.id;
-  const rows = [];
-  for (let start = 0; ; start += 500) {
-    const { data, error } = await state.client.from("cards")
-      .select("id,phrase,meaning,created_on,created_at,next_review_at,review_step")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .range(start, start + 499);
-    if (error) throw error;
-    rows.push(...data);
-    if (data.length < 500) break;
+async function githubRequest(path, options = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    ...options,
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${state.token}`,
+      "X-GitHub-Api-Version": "2026-03-10",
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+    },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(response.status === 401 || response.status === 403
+      ? "GitHub 토큰과 저장소 권한을 확인해 주세요."
+      : response.status === 404 ? "비공개 데이터 저장소를 찾지 못했어요."
+      : "GitHub에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.");
+    error.status = response.status;
+    throw error;
   }
-  if (state.user?.id !== userId) return;
-  state.cards = rows;
+  return data;
+}
+
+const contentPath = (path) => `/repos/${config.dataRepo}/contents/${path}`;
+const monthPath = (date) => `data/${date.slice(0, 7)}.json`;
+
+function decodeContent(encoded) {
+  const binary = atob(encoded.replace(/\s/g, ""));
+  return new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
+}
+
+function encodeContent(value) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value, null, 2) + "\n");
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function readMonth(path) {
+  try {
+    const file = await githubRequest(contentPath(path));
+    const document = JSON.parse(decodeContent(file.content));
+    if (!Array.isArray(document.cards)) throw new Error("단어장 파일 형식이 올바르지 않아요.");
+    const cards = document.cards.filter((card) => card
+      && typeof card.id === "string" && typeof card.phrase === "string"
+      && typeof card.meaning === "string" && /^\d{4}-\d{2}-\d{2}$/.test(card.created_on)
+      && !Number.isNaN(Date.parse(card.created_at))
+      && !Number.isNaN(Date.parse(card.next_review_at))
+      && Number.isInteger(card.review_step) && card.review_step >= 0);
+    if (cards.length !== document.cards.length) throw new Error("단어장 파일에 잘못된 카드가 있어요.");
+    return { cards, sha: file.sha };
+  } catch (error) {
+    if (error.status === 404) return { cards: [], sha: null };
+    throw error;
+  }
+}
+
+async function loadCards() {
+  if (!state.token) return;
+  const token = state.token;
+  let files;
+  try { files = await githubRequest(contentPath("data")); }
+  catch (error) {
+    if (error.status !== 404) throw error;
+    files = [];
+  }
+  if (!Array.isArray(files)) throw new Error("단어장 폴더 형식이 올바르지 않아요.");
+  const monthFiles = files.filter((file) => /^\d{4}-\d{2}\.json$/.test(file.name));
+  const months = await Promise.all(monthFiles.map((file) => readMonth(file.path)));
+  if (state.token !== token) return;
+  state.cards = months.flatMap((month) => month.cards)
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   render();
+}
+
+async function changeMonth(path, action) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const file = await readMonth(path);
+    const nextCards = action(file.cards.map((card) => ({ ...card })));
+    const body = {
+      message: `Update expression notebook ${path}`,
+      content: encodeContent({ version: 1, cards: nextCards }),
+      ...(file.sha ? { sha: file.sha } : {}),
+    };
+    try {
+      await githubRequest(contentPath(path), { method: "PUT", body: JSON.stringify(body) });
+      return;
+    } catch (error) {
+      if (error.status !== 409 || attempt === 2) throw error;
+    }
+  }
 }
 
 async function saveCard(event) {
@@ -190,11 +263,19 @@ async function saveCard(event) {
   const button = $("#card-form button[type=submit]");
   button.disabled = true;
   try {
-    const query = id
-      ? state.client.from("cards").update({ phrase, meaning }).eq("id", id).eq("user_id", state.user.id)
-      : state.client.from("cards").insert({ user_id: state.user.id, phrase, meaning, created_on: seoulDate() });
-    const { error } = await query;
-    if (error) throw error;
+    const original = id ? state.cards.find((card) => card.id === id) : null;
+    if (id && !original) throw new Error("수정할 표현을 찾지 못했어요.");
+    const card = original ?? {
+      id: crypto.randomUUID(), phrase, meaning, created_on: seoulDate(),
+      created_at: new Date().toISOString(), next_review_at: new Date().toISOString(), review_step: 0,
+    };
+    await changeMonth(monthPath(card.created_on), (cards) => {
+      if (!id) return cards.some((item) => item.id === card.id) ? cards : [...cards, card];
+      const index = cards.findIndex((item) => item.id === id);
+      if (index < 0) throw new Error("다른 기기에서 삭제된 표현이에요. 새로고침해 주세요.");
+      cards[index] = { ...cards[index], phrase, meaning };
+      return cards;
+    });
     $("#card-dialog").close();
     message(id ? "표현을 수정했어요." : "새 표현을 저장했어요.");
     await loadCards();
@@ -208,8 +289,9 @@ async function saveCard(event) {
 async function deleteCard(id) {
   if (!confirm("이 표현을 삭제할까요?")) return;
   try {
-    const { error } = await state.client.from("cards").delete().eq("id", id).eq("user_id", state.user.id);
-    if (error) throw error;
+    const card = state.cards.find((item) => item.id === id);
+    if (!card) throw new Error("삭제할 표현을 찾지 못했어요.");
+    await changeMonth(monthPath(card.created_on), (cards) => cards.filter((item) => item.id !== id));
     message("표현을 삭제했어요.");
     await loadCards();
   } catch (error) {
@@ -220,41 +302,49 @@ async function deleteCard(id) {
 async function reviewCard(kind) {
   const card = dueCards()[0];
   if (!card) return;
-  const steps = [1, 3, 7, 14, 30];
-  const nextStep = kind === "familiar" ? Math.min(card.review_step + 1, steps.length) : 0;
-  const next = new Date();
-  if (kind === "familiar") next.setDate(next.getDate() + steps[nextStep - 1]);
-  if (kind === "again") next.setMinutes(next.getMinutes() + 10);
-  const nextReviewAt = next.toISOString();
   for (const button of document.querySelectorAll(".review-actions button")) button.disabled = true;
   try {
-    const { error } = await state.client.from("cards")
-      .update({ review_step: nextStep, next_review_at: nextReviewAt })
-      .eq("id", card.id).eq("user_id", state.user.id);
-    if (error) throw error;
-    card.review_step = nextStep;
-    card.next_review_at = nextReviewAt;
+    await changeMonth(monthPath(card.created_on), (cards) => {
+      const current = cards.find((item) => item.id === card.id);
+      if (!current) throw new Error("다른 기기에서 삭제된 표현이에요. 새로고침해 주세요.");
+      const steps = [1, 3, 7, 14, 30];
+      const nextStep = kind === "familiar" ? Math.min(current.review_step + 1, steps.length) : 0;
+      const next = new Date();
+      if (kind === "familiar") next.setDate(next.getDate() + steps[nextStep - 1]);
+      if (kind === "again") next.setMinutes(next.getMinutes() + 10);
+      current.review_step = nextStep;
+      current.next_review_at = next.toISOString();
+      return cards;
+    });
     state.lastReviewedId = card.id;
     state.revealed = false;
-    render();
+    await loadCards();
   } catch (error) {
     message(`복습 결과를 저장하지 못했어요. ${error.message}`, true);
     render();
   }
 }
 
-async function handleSession(session) {
-  const user = session?.user ?? null;
-  if (state.user?.id === user?.id) return;
-  state.user = user;
-  state.cards = [];
-  state.allOrder = [];
-  state.allIndex = 0;
-  state.lastReviewedId = null;
-  if (!user) { showOnly("auth-view"); return; }
-  showOnly("app-view");
-  try { await loadCards(); }
-  catch (error) { message(`단어장을 불러오지 못했어요. ${error.message}`, true); }
+async function connect(token, remember) {
+  state.token = token;
+  try {
+    const repo = await githubRequest(`/repos/${config.dataRepo}`);
+    if (!repo.private) throw new Error("단어장 데이터 저장소는 비공개로 만들어 주세요.");
+    await loadCards();
+    if (remember) {
+      localStorage.setItem("expression-book-token", token);
+      sessionStorage.removeItem("expression-book-token");
+    } else {
+      sessionStorage.setItem("expression-book-token", token);
+      localStorage.removeItem("expression-book-token");
+    }
+    showOnly("app-view");
+    $("#auth-message").textContent = "";
+    $("#auth-message").classList.remove("error");
+  } catch (error) {
+    state.token = null;
+    throw error;
+  }
 }
 
 document.addEventListener("click", async (event) => {
@@ -287,46 +377,45 @@ $("#shuffle-button").addEventListener("click", () => {
 if (!configured) {
   showOnly("setup-view");
 } else {
-  try {
-    const { createClient } = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
-    state.client = createClient(config.supabaseUrl, config.supabasePublishableKey);
-    state.view = location.hash.slice(1) || "today";
-    state.client.auth.onAuthStateChange((_event, session) => setTimeout(() => handleSession(session), 0));
-    const { data, error } = await state.client.auth.getSession();
-    if (error) throw error;
-    await handleSession(data.session);
-    $("#login-form").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const button = $("#login-form button");
-      button.disabled = true;
-      $("#auth-message").textContent = "";
-      const email = $("#email").value.trim();
-      try {
-        const { error } = await state.client.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname } });
-        if (error) throw error;
-        $("#auth-message").textContent = "이메일을 확인해 주세요. 로그인 링크를 보냈어요.";
-        $("#auth-message").classList.remove("error");
-      } catch (error) {
-        $("#auth-message").textContent = `로그인 링크를 보내지 못했어요. ${error.message}`;
-        $("#auth-message").classList.add("error");
-      } finally {
-        button.disabled = false;
-      }
-    });
-    $("#sign-out").addEventListener("click", async () => {
-      const { error } = await state.client.auth.signOut();
-      if (error) message(`로그아웃하지 못했어요. ${error.message}`, true);
-    });
-    document.addEventListener("visibilitychange", async () => {
-      if (!document.hidden && state.user) {
-        try { await loadCards(); }
-        catch (error) { message(`최신 단어장을 불러오지 못했어요. ${error.message}`, true); }
-      }
-    });
-    setInterval(() => { if (state.user) render(); }, 60_000);
-  } catch (error) {
+  state.view = location.hash.slice(1) || "today";
+  showOnly("auth-view");
+  $("#login-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = $("#login-form button");
+    button.disabled = true;
+    $("#auth-message").textContent = "";
+    try {
+      await connect($("#token").value.trim(), $("#remember-token").checked);
+      $("#token").value = "";
+    } catch (error) {
+      $("#auth-message").textContent = `연결하지 못했어요. ${error.message}`;
+      $("#auth-message").classList.add("error");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  $("#sign-out").addEventListener("click", () => {
+    state.token = null;
+    state.cards = [];
+    state.allOrder = [];
+    localStorage.removeItem("expression-book-token");
+    sessionStorage.removeItem("expression-book-token");
     showOnly("auth-view");
-    $("#auth-message").textContent = `연결에 실패했어요. ${error.message}`;
-    $("#auth-message").classList.add("error");
+  });
+  document.addEventListener("visibilitychange", async () => {
+    if (!document.hidden && state.token) {
+      try { await loadCards(); }
+      catch (error) { message(`최신 단어장을 불러오지 못했어요. ${error.message}`, true); }
+    }
+  });
+  setInterval(() => { if (state.token) render(); }, 60_000);
+  const savedToken = localStorage.getItem("expression-book-token") || sessionStorage.getItem("expression-book-token");
+  if (savedToken) {
+    connect(savedToken, Boolean(localStorage.getItem("expression-book-token"))).catch((error) => {
+      localStorage.removeItem("expression-book-token");
+      sessionStorage.removeItem("expression-book-token");
+      $("#auth-message").textContent = `다시 연결해 주세요. ${error.message}`;
+      $("#auth-message").classList.add("error");
+    });
   }
 }
