@@ -1,5 +1,4 @@
-// Supabase 프로젝트를 연결할 때 이 두 값을 입력하세요. 공개 가능한 프로젝트 URL과 publishable key만 사용합니다.
+// 단어장 데이터는 별도의 비공개 GitHub 저장소에 저장합니다.
 window.APP_CONFIG = {
-  supabaseUrl: "",
-  supabasePublishableKey: "",
+  dataRepo: "completewritersai/English-study-data",
 };
